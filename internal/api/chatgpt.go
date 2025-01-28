@@ -5,12 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 )
 
 type ChatGPT struct {
 	apiKey string
+	model  string
+	context []chatMessage
 }
+
+const (
+	ModelGPT3 = "gpt-3.5-turbo"
+	ModelGPT4 = "gpt-4"
+)
 
 type chatRequest struct {
 	Model    string        `json:"model"`
@@ -31,21 +39,34 @@ type chatResponse struct {
 }
 
 func NewChatGPT(apiKey string) *ChatGPT {
-	return &ChatGPT{apiKey: apiKey}
+	return &ChatGPT{
+		apiKey: apiKey,
+		model:  ModelGPT3,
+	}
+}
+
+func (c *ChatGPT) SetModel(model string) {
+	c.model = model
 }
 
 func (c *ChatGPT) SendMessage(prompt string) (string, error) {
+	c.context = append(c.context, chatMessage{Role: "user", Content: prompt})
+
+	if len(c.context) > 10 {
+		c.context = c.context[len(c.context)-10:]
+	}
+
 	reqBody := chatRequest{
-		Model: "gpt-3.5-turbo",
-		Messages: []chatMessage{
-			{Role: "user", Content: prompt},
-		},
+		Model:    c.model,
+		Messages: c.context,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("помилка маршалінгу запиту: %w", err)
 	}
+
+	log.Printf("Відправляємо запит до OpenAI: %s", string(jsonData))
 
 	req, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -75,5 +96,14 @@ func (c *ChatGPT) SendMessage(prompt string) (string, error) {
 		return "", fmt.Errorf("порожня відповідь від API")
 	}
 
+	c.context = append(c.context, chatMessage{
+		Role:    "assistant",
+		Content: response.Choices[0].Message.Content,
+	})
+
 	return response.Choices[0].Message.Content, nil
+}
+
+func (c *ChatGPT) ClearContext() {
+	c.context = nil
 } 
