@@ -1,12 +1,13 @@
 package bot
 
 import (
-	"fmt"
-	"log"
 	"GPTGRAMM/internal/api"
 	"GPTGRAMM/internal/storage"
-	"time"
+	"fmt"
+	"log"
+	"strings"
 	"sync"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -14,24 +15,58 @@ import (
 // Додаємо нові типи та константи
 const (
 	maxRequestsPerDay = 10
-	bypassCode       = "UNLIMITED_ACCESS"  // Кодова фраза для обходу ліміту
+	bypassCode        = "UNLIMITED_ACCESS" // Кодова фраза для обходу ліміту
+	maxStoredMessages = 100                // Максимальна кількість збережених ID повідомлень
+	logFormat        = "%-25s | %-10d | %s\n"
 )
 
 // Додаємо структуру для налаштувань користувача
 type UserSettings struct {
-	Model       string
+	Model        string
 	RequestCount int
 	LastRequest  time.Time
 }
 
 // Bot представляє основну структуру телеграм бота
 type Bot struct {
-	api         *tgbotapi.BotAPI
-	storage     *storage.Storage
-	chatGPTs    map[int64]*api.ChatGPT
-	users       map[int64]*UserSettings
-	messageIDs  map[int64][]int // Зберігаємо всі ID повідомлень для кожного чату
-	mu          sync.RWMutex
+	api        *tgbotapi.BotAPI
+	storage    *storage.Storage
+	chatGPTs   sync.Map
+	users      sync.Map
+	messageIDs sync.Map // chatID -> *MessageQueue
+}
+
+// MessageQueue зберігає обмежену кількість ID повідомлень
+type MessageQueue struct {
+	mu      sync.Mutex
+	ids     []int
+	maxSize int
+}
+
+func NewMessageQueue(size int) *MessageQueue {
+	return &MessageQueue{
+		ids:     make([]int, 0, size),
+		maxSize: size,
+	}
+}
+
+func (q *MessageQueue) Add(id int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.ids = append(q.ids, id)
+	if len(q.ids) > q.maxSize {
+		q.ids = q.ids[1:]
+	}
+}
+
+func (q *MessageQueue) GetAll() []int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	result := make([]int, len(q.ids))
+	copy(result, q.ids)
+	return result
 }
 
 // NewBot створює новий екземпляр бота
@@ -47,11 +82,8 @@ func NewBot(token string) (*Bot, error) {
 	}
 
 	return &Bot{
-		api:         bot,
-		storage:     storage,
-		chatGPTs:    make(map[int64]*api.ChatGPT),
-		users:       make(map[int64]*UserSettings),
-		messageIDs:  make(map[int64][]int),
+		api:     bot,
+		storage: storage,
 	}, nil
 }
 
@@ -75,36 +107,38 @@ func (b *Bot) Start() {
 
 func (b *Bot) handleMessage(message *tgbotapi.Message) {
 	chatID := message.Chat.ID
-	
-	// Зберігаємо ID повідомлення користувача
-	b.mu.Lock()
-	if b.messageIDs[chatID] == nil {
-		b.messageIDs[chatID] = make([]int, 0)
-	}
-	b.messageIDs[chatID] = append(b.messageIDs[chatID], message.MessageID)
-	b.mu.Unlock()
-
 	text := message.Text
+
+	// Зберігаємо ID повідомлення
+	queue, _ := b.messageIDs.LoadOrStore(chatID, NewMessageQueue(maxStoredMessages))
+	queue.(*MessageQueue).Add(message.MessageID)
 
 	switch text {
 	case "/start":
+		logAction("КОМАНДА", chatID, "👋 Початок роботи")
 		b.handleStart(chatID)
 	case "📊 Статистика":
+		logAction("КОМАНДА", chatID, "📊 Перегляд статистики")
 		b.handleStats(chatID)
 	case "⚙️ Налаштування":
+		logAction("КОМАНДА", chatID, "⚙️ Відкрито налаштування")
 		b.handleSettings(chatID)
 	case "🔄 Новий чат":
 		b.handleNewChat(chatID)
 	case "❓ Допомога":
+		logAction("КОМАНДА", chatID, "❓ Запит допомоги")
 		b.handleHelp(chatID)
 	case bypassCode:
+		logAction("КОМАНДА", chatID, "🔓 Використано код обходу ліміту")
 		b.handleBypassCode(chatID)
 	default:
 		if len(text) > 3 && text[:3] == "sk-" {
+			logAction("КОМАНДА", chatID, "🔑 Отримано API ключ")
 			b.handleAPIKey(chatID, text)
 		} else {
 			// Перевіряємо ліміт запитів тільки для звернень до GPT
 			if !b.checkRequestLimit(chatID) && text != bypassCode {
+				logAction("ПОМИЛКА", chatID, "⚠️ Досягнуто ліміт запитів")
 				b.sendMessage(chatID, "⚠️ Ви досягли ліміту запитів на сьогодні. Використайте кодову фразу для необмеженого доступу.")
 				return
 			}
@@ -155,11 +189,15 @@ func (b *Bot) handleHelp(chatID int64) {
 }
 
 func (b *Bot) handleAPIKey(chatID int64, apiKey string) {
+	logAction("API_KEY", chatID, "Спроба зберегти новий API ключ")
+	
 	if err := b.storage.SaveAPIKey(chatID, apiKey); err != nil {
+		logAction("ПОМИЛКА", chatID, fmt.Sprintf("Не вдалося зберегти API ключ: %v", err))
 		b.sendMessage(chatID, "❌ Помилка збереження ключа. Спробуйте ще раз.")
 		return
 	}
 
+	logAction("API_KEY", chatID, "API ключ успішно збережено")
 	msg := tgbotapi.NewMessage(chatID, "✅ API ключ успішно збережено! Тепер ви можете надсилати повідомлення.")
 	msg.ReplyMarkup = createMainKeyboard()
 	if _, err := b.api.Send(msg); err != nil {
@@ -168,28 +206,34 @@ func (b *Bot) handleAPIKey(chatID int64, apiKey string) {
 }
 
 func (b *Bot) handleGPTRequest(chatID int64, text string) {
-	b.mu.Lock()
-	gpt, exists := b.chatGPTs[chatID]
-	if !exists {
+	logAction("ЗАПИТ", chatID, "Відправлено запит до GPT")
+	
+	// Отримуємо існуючий або створюємо новий ChatGPT
+	gptInstance, _ := b.chatGPTs.LoadOrStore(chatID, func() interface{} {
 		apiKey, err := b.storage.GetAPIKey(chatID)
 		if err != nil {
-			b.mu.Unlock()
-			b.sendMessage(chatID, "❌ Будь ласка, спочатку надішліть свій API ключ.")
-			return
+			return nil
 		}
 		model, _ := b.storage.GetUserSettings(chatID)
-		gpt = api.NewChatGPT(apiKey)
+		gpt := api.NewChatGPT(apiKey)
 		gpt.SetModel(model)
-		b.chatGPTs[chatID] = gpt
-	}
-	b.mu.Unlock()
+		return gpt
+	}())
 
+	if gptInstance == nil {
+		b.sendMessage(chatID, "❌ Будь ласка, спочатку надішліть свій API ключ.")
+		return
+	}
+
+	gpt := gptInstance.(*api.ChatGPT)
 	response, err := gpt.SendMessage(text)
 	if err != nil {
+		logAction("ПОМИЛКА", chatID, fmt.Sprintf("Помилка GPT: %v", err))
 		b.sendMessage(chatID, fmt.Sprintf("❌ Помилка: %v", err))
 		return
 	}
 
+	logAction("ВІДПОВІДЬ", chatID, "Отримано відповідь від GPT")
 	if err := b.storage.SaveToHistory(chatID, text, response); err != nil {
 		log.Printf("Помилка збереження в історію: %v", err)
 	}
@@ -202,6 +246,11 @@ func (b *Bot) sendMessage(chatID int64, text string, markdown ...bool) {
 	if len(markdown) > 0 && markdown[0] {
 		msg.ParseMode = tgbotapi.ModeMarkdown
 	}
+	
+	// Завжди додаємо основну клавіатуру, якщо не вказано інше
+	if msg.ReplyMarkup == nil {
+		msg.ReplyMarkup = createMainKeyboard()
+	}
 
 	sent, err := b.api.Send(msg)
 	if err != nil {
@@ -210,12 +259,8 @@ func (b *Bot) sendMessage(chatID int64, text string, markdown ...bool) {
 	}
 
 	// Зберігаємо ID повідомлення бота
-	b.mu.Lock()
-	if b.messageIDs[chatID] == nil {
-		b.messageIDs[chatID] = make([]int, 0)
-	}
-	b.messageIDs[chatID] = append(b.messageIDs[chatID], sent.MessageID)
-	b.mu.Unlock()
+	queue, _ := b.messageIDs.LoadOrStore(chatID, NewMessageQueue(maxStoredMessages))
+	queue.(*MessageQueue).Add(sent.MessageID)
 }
 
 // Оновлюємо функцію createMainKeyboard
@@ -239,17 +284,16 @@ func createMainKeyboard() tgbotapi.ReplyKeyboardMarkup {
 
 // Додаємо нові обробники
 func (b *Bot) handleStats(chatID int64) {
-	b.mu.RLock()
-	stats := b.users[chatID]
-	b.mu.RUnlock()
-
-	if stats == nil {
-		b.sendMessage(chatID, "📊 Статистика:\nЗапитів сьогодні: 0")
-		return
+	value, exists := b.users.Load(chatID)
+	
+	var requestCount int
+	if exists && value != nil {
+		settings := value.(UserSettings)
+		requestCount = settings.RequestCount
 	}
 
-	text := fmt.Sprintf("📊 Статистика:\nЗапитів сьогодні: %d/%d", 
-		stats.RequestCount, maxRequestsPerDay)
+	text := fmt.Sprintf("📊 Статистика:\nЗапитів сьогодні: %d/%d",
+		requestCount, maxRequestsPerDay)
 	b.sendMessage(chatID, text)
 }
 
@@ -269,47 +313,67 @@ func (b *Bot) handleSettings(chatID int64) {
 }
 
 func (b *Bot) handleBypassCode(chatID int64) {
-	b.mu.Lock()
-	b.users[chatID] = &UserSettings{} // Скидаємо лічильник
-	b.mu.Unlock()
+	// Отримуємо поточні налаштування або створюємо нові
+	value, _ := b.users.Load(chatID)
+	var settings UserSettings
+	if value != nil {
+		settings = value.(UserSettings)
+	}
+	
+	// Скидаємо лічильник, зберігаючи інші налаштування
+	settings.RequestCount = 0
+	settings.LastRequest = time.Now()
+	
+	b.users.Store(chatID, settings)
 	b.sendMessage(chatID, "✅ Ліміт запитів знято")
 }
 
 // Додаємо перевірку ліміту запитів
 func (b *Bot) checkRequestLimit(chatID int64) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.users[chatID] == nil {
-		b.users[chatID] = &UserSettings{Model: api.ModelGPT3}
+	value, exists := b.users.Load(chatID)
+	
+	var settings UserSettings
+	if !exists || value == nil {
+		// Створюємо нові налаштування для нового користувача
+		settings = UserSettings{
+			Model:        api.ModelGPT3,
+			RequestCount: 0,
+			LastRequest:  time.Now(),
+		}
+	} else {
+		settings = value.(UserSettings)
 	}
 
-	settings := b.users[chatID]
-
+	// Скидаємо лічильник, якщо минуло 24 години
 	if time.Since(settings.LastRequest).Hours() >= 24 {
 		settings.RequestCount = 0
+		settings.LastRequest = time.Now()
 	}
 
+	// Перевіряємо ліміт
 	if settings.RequestCount >= maxRequestsPerDay {
 		return false
 	}
 
+	// Оновлюємо лічильник
 	settings.RequestCount++
 	settings.LastRequest = time.Now()
+	b.users.Store(chatID, settings)
+	
 	return true
 }
 
 // Оновлюємо обробник callback-ів
 func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 	chatID := callback.Message.Chat.ID
-	log.Printf("Отримано callback %s від користувача %d", callback.Data, chatID)
+	logAction("CALLBACK", chatID, fmt.Sprintf("Дія: %s", callback.Data))
 
 	callbackResponse := tgbotapi.NewCallback(callback.ID, "")
 	if _, err := b.api.Request(callbackResponse); err != nil {
 		log.Printf("Помилка відповіді на callback: %v", err)
 	}
 
-	var msg tgbotapi.MessageConfig // Оголошуємо змінну на початку функції
+	var msg tgbotapi.MessageConfig
 
 	switch callback.Data {
 	case "clear_confirm":
@@ -342,21 +406,35 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		msg = tgbotapi.NewMessage(chatID, "🔄 Очищення історії скасовано")
 
 	case "model_gpt3":
-		log.Printf("Змінюємо модель на GPT-3.5 для користувача %d", chatID)
-		if err := b.storage.SaveUserSettings(chatID, api.ModelGPT3); err != nil {
-			msg = tgbotapi.NewMessage(chatID, "❌ Помилка зміни моделі")
-			log.Printf("Помилка збереження налаштувань: %v", err)
+		// Отримуємо поточну модель
+		currentModel, _ := b.storage.GetUserSettings(chatID)
+		if currentModel == api.ModelGPT3 {
+			logAction("МОДЕЛЬ", chatID, "Спроба зміни на поточну модель GPT-3.5")
+			msg = tgbotapi.NewMessage(chatID, "ℹ️ GPT-3.5 вже є поточною моделлю")
 		} else {
-			msg = tgbotapi.NewMessage(chatID, "✅ Модель змінено на GPT-3.5")
+			logAction("МОДЕЛЬ", chatID, "Зміна на GPT-3.5")
+			if err := b.storage.SaveUserSettings(chatID, api.ModelGPT3); err != nil {
+				logAction("ПОМИЛКА", chatID, fmt.Sprintf("Не вдалося змінити модель: %v", err))
+				msg = tgbotapi.NewMessage(chatID, "❌ Помилка зміни моделі")
+			} else {
+				msg = tgbotapi.NewMessage(chatID, "✅ Модель змінено на GPT-3.5")
+			}
 		}
 
 	case "model_gpt4":
-		log.Printf("Змінюємо модель на GPT-4 для користувача %d", chatID)
-		if err := b.storage.SaveUserSettings(chatID, api.ModelGPT4); err != nil {
-			msg = tgbotapi.NewMessage(chatID, "❌ Помилка зміни моделі")
-			log.Printf("Помилка збереження налаштувань: %v", err)
+		// Отримуємо поточну модель
+		currentModel, _ := b.storage.GetUserSettings(chatID)
+		if currentModel == api.ModelGPT4 {
+			logAction("МОДЕЛЬ", chatID, "Спроба зміни на поточну модель GPT-4")
+			msg = tgbotapi.NewMessage(chatID, "ℹ️ GPT-4 вже є поточною моделлю")
 		} else {
-			msg = tgbotapi.NewMessage(chatID, "✅ Модель змінено на GPT-4")
+			logAction("МОДЕЛЬ", chatID, "Зміна на GPT-4")
+			if err := b.storage.SaveUserSettings(chatID, api.ModelGPT4); err != nil {
+				logAction("ПОМИЛКА", chatID, fmt.Sprintf("Не вдалося змінити модель: %v", err))
+				msg = tgbotapi.NewMessage(chatID, "❌ Помилка зміни моделі")
+			} else {
+				msg = tgbotapi.NewMessage(chatID, "✅ Модель змінено на GPT-4")
+			}
 		}
 	}
 
@@ -365,114 +443,121 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 	}
 }
 
-// Додаємо новий обробник для нового чату
+// Оновлюємо новий обробник для нового чату
 func (b *Bot) handleNewChat(chatID int64) {
-	// Отримуємо API ключ для перевірки
+	logAction("КОМАНДА", chatID, "🔄 Новий чат")
+
+	// Перевірка API ключа
 	apiKey, err := b.storage.GetAPIKey(chatID)
 	if err != nil || apiKey == "" {
-		text := `👋 Для початку роботи, будь ласка, надішліть свій OpenAI API ключ.
-Якщо у вас його немає, отримайте на сайті: https://platform.openai.com/account/api-keys`
-		b.sendMessage(chatID, text)
+		logAction("ПОМИЛКА", chatID, "API ключ не знайдено")
+		b.sendMessage(chatID, "👋 Для початку роботи, будь ласка, надішліть свій OpenAI API ключ.")
 		return
 	}
+
+	// Отримуємо поточну модель перед очищенням
+	model, _ := b.storage.GetUserSettings(chatID)
+	logAction("ІНФО", chatID, fmt.Sprintf("Поточна модель: %s", model))
 
 	// Показуємо індикатор процесу
 	msg := tgbotapi.NewMessage(chatID, "🔄 Очищення чату...")
 	statusMsg, _ := b.api.Send(msg)
 
-	// Створюємо новий екземпляр ChatGPT заздалегідь
-	b.mu.Lock()
-	model, _ := b.storage.GetUserSettings(chatID)
-	gpt := api.NewChatGPT(apiKey)
-	gpt.SetModel(model)
-	b.chatGPTs[chatID] = gpt
-	b.mu.Unlock()
+	// Очищаємо історію в базі даних без логування
+	_ = b.storage.ClearHistory(chatID)
 
-	// Готуємо текст нового повідомлення
-	text := `🆕 Починаємо новий чат!
+	// Процес видалення повідомлень...
+	deletedCount := 0
+	failedCount := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 
-Я готовий допомогти вам з будь-якими питаннями. 
-Просто напишіть ваше повідомлення.
-
-Поточна модель: `
-
-	if model == api.ModelGPT3 {
-		text += "GPT-3.5"
-	} else {
-		text += "GPT-4"
-	}
-
-	// Видаляємо всі попередні повідомлення
-	lastMsg := b.getLastMessageID(chatID)
-	log.Printf("Починаємо видалення повідомлень для чату %d, останній ID: %d", chatID, lastMsg)
+	// Зменшуємо діапазон до останніх 50 повідомлень для безпечнішої роботи
+	lastMsgID := statusMsg.MessageID
+	startID := lastMsgID - 50
 	
-	// Використовуємо адаптивний крок
-	deleteChan := make(chan struct{}, 50) // Збільшуємо паралельність
-	
-	// Розбиваємо діапазон на сегменти з різними кроками
-	segments := []struct {
-		start, end, step int
-	}{
-		{lastMsg - 100, lastMsg, 1},      // Останні 100 повідомлень видаляємо по одному
-		{lastMsg - 500, lastMsg - 100, 5}, // Наступні 400 повідомлень видаляємо по 5
-		{0, lastMsg - 500, 20},           // Старі повідомлення видаляємо по 20
-	}
+	logAction("ПРОЦЕС", chatID, fmt.Sprintf("Видалення повідомлень %d-%d", startID, lastMsgID))
 
-	for _, seg := range segments {
-		for i := seg.end; i > seg.start && i > 0; i -= seg.step {
-			deleteChan <- struct{}{}
-			go func(msgID, step int) {
-				defer func() { <-deleteChan }()
-				
-				// Видаляємо блок повідомлень
-				for j := msgID; j > msgID-step && j > 0; j-- {
-					if j != statusMsg.MessageID {
-						deleteMsg := tgbotapi.NewDeleteMessage(chatID, j)
-						if _, err := b.api.Request(deleteMsg); err == nil {
-							log.Printf("Видалено повідомлення %d в чаті %d", j, chatID)
+	// Збільшуємо кількість воркерів для швидшої роботи
+	workers := 20
+	messagesChan := make(chan int, lastMsgID-startID)
+
+	// Запускаємо воркери
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for msgID := range messagesChan {
+				if msgID != statusMsg.MessageID {
+					deleteMsg := tgbotapi.NewDeleteMessage(chatID, msgID)
+					if _, err := b.api.Request(deleteMsg); err != nil {
+						if !strings.Contains(err.Error(), "message to delete not found") {
+							mu.Lock()
+							failedCount++
+							mu.Unlock()
 						}
+					} else {
+						mu.Lock()
+						deletedCount++
+						mu.Unlock()
 					}
 				}
-			}(i, seg.step)
-		}
+			}
+		}()
 	}
+
+	// Відправляємо ID повідомлень на видалення
+	for msgID := lastMsgID; msgID > startID && msgID > 0; msgID-- {
+		messagesChan <- msgID
+	}
+	close(messagesChan)
 
 	// Чекаємо завершення всіх горутин
-	for i := 0; i < cap(deleteChan); i++ {
-		deleteChan <- struct{}{}
-	}
+	wg.Wait()
 
-	// Очищаємо історію в базі даних
-	if err := b.storage.ClearHistory(chatID); err != nil {
-		log.Printf("Помилка очищення історії: %v", err)
-	}
+	logAction("РЕЗУЛЬТАТ", chatID, fmt.Sprintf("Видалено: %d, Помилок: %d", deletedCount, failedCount))
 
 	// Видаляємо індикатор процесу
 	deleteMsg := tgbotapi.NewDeleteMessage(chatID, statusMsg.MessageID)
 	b.api.Request(deleteMsg)
 
-	// В останню чергу надсилаємо нове повідомлення
-	newMsg := tgbotapi.NewMessage(chatID, text)
-	newMsg.ReplyMarkup = createMainKeyboard()
-	sent, err := b.api.Send(newMsg)
+	// Оновлюємо стан чату
+	gpt := api.NewChatGPT(apiKey)
+	gpt.SetModel(model)
+	b.chatGPTs.Store(chatID, gpt)
+	b.messageIDs.Store(chatID, NewMessageQueue(maxStoredMessages))
+
+	// Надсилаємо повідомлення про новий чат з емодзі
+	text := fmt.Sprintf(`🆕 Починаємо новий чат!
+
+🤖 Поточна модель: %s
+🗑️ Видалено повідомлень: %d
+⚡️ Готовий до роботи!
+
+💡 Відправте повідомлення для продовження діалогу`,
+		map[string]string{api.ModelGPT3: "GPT-3.5", api.ModelGPT4: "GPT-4"}[model],
+		deletedCount)
+
+	// Обов'язково додаємо клавіатуру перед надсиланням
+	msg = tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = createMainKeyboard()
+	
+	// Надсилаємо повідомлення та чекаємо на його відправку
+	sent, err := b.api.Send(msg)
 	if err != nil {
-		log.Printf("Помилка надсилання повідомлення: %v", err)
+		logAction("ПОМИЛКА", chatID, fmt.Sprintf("Не вдалося надіслати повідомлення: %v", err))
 		return
 	}
 
 	// Зберігаємо ID нового повідомлення
-	b.mu.Lock()
-	b.messageIDs[chatID] = []int{sent.MessageID}
-	b.mu.Unlock()
+	queue, _ := b.messageIDs.LoadOrStore(chatID, NewMessageQueue(maxStoredMessages))
+	queue.(*MessageQueue).Add(sent.MessageID)
+
+	logAction("УСПІХ", chatID, "Чат очищено та налаштовано")
 }
 
-// Оптимізуємо отримання останнього ID
-func (b *Bot) getLastMessageID(chatID int64) int {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	
-	if messages, ok := b.messageIDs[chatID]; ok && len(messages) > 0 {
-		return messages[len(messages)-1] + 10 // Зменшуємо запас, бо використовуємо адаптивний крок
-	}
-	return 50 // Зменшуємо початкову кількість спроб
-} 
+// Оновлюємо функцію logAction
+func logAction(action string, chatID int64, details string) {
+
+	log.Printf(logFormat, action, chatID, details)
+}
