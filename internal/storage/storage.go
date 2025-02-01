@@ -3,31 +3,39 @@ package storage
 import (
 	"database/sql"
 	"fmt"
-	_ "modernc.org/sqlite"
-	"time"
 	"log"
-	"GPTGRAMM/internal/api"
+	_ "modernc.org/sqlite"
+	"sync"
+	"time"
 )
 
 type Storage struct {
-	db *sql.DB
+	db         *sql.DB
+	modelCache map[int64]string // ✅ Додаємо кеш
+	mu         sync.RWMutex     // ✅ Додаємо м'ютекс
 }
+
+var settingsCache = sync.Map{}
 
 func NewStorage() (*Storage, error) {
 	db, err := sql.Open("sqlite", "bot.db")
 	if err != nil {
-		return nil, fmt.Errorf("помилка підключення до бази даних: %w", err)
+		return nil, fmt.Errorf("❌ Помилка підключення до бази: %w", err)
 	}
 
 	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("помилка перевірки з'єднання з базою даних: %w", err)
+		return nil, fmt.Errorf("❌ Помилка перевірки підключення: %w", err)
 	}
 
 	if err := createTables(db); err != nil {
-		return nil, fmt.Errorf("помилка створення таблиць: %w", err)
+		return nil, fmt.Errorf("❌ Помилка створення таблиць: %w", err)
 	}
 
-	return &Storage{db: db}, nil
+	return &Storage{
+		db:         db,
+		modelCache: make(map[int64]string),
+		mu:         sync.RWMutex{},
+	}, nil
 }
 
 func createTables(db *sql.DB) error {
@@ -60,12 +68,20 @@ func createTables(db *sql.DB) error {
 }
 
 func (s *Storage) SaveAPIKey(chatID int64, apiKey string) error {
-	query := `
-	INSERT INTO users (chat_id, api_key) 
-	VALUES (?, ?) 
-	ON CONFLICT(chat_id) DO UPDATE SET api_key = excluded.api_key`
-	
-	_, err := s.db.Exec(query, chatID, apiKey)
+	stmt, err := s.db.Prepare(`
+		INSERT INTO users (chat_id, api_key) 
+		VALUES (?, ?) 
+		ON CONFLICT(chat_id) DO UPDATE SET api_key = excluded.api_key`)
+	if err != nil {
+		log.Printf("Помилка підготовки SQL-запиту: %v", err)
+		return err
+	}
+	defer stmt.Close() // Гарантовано закриваємо запит після виконання
+
+	_, err = stmt.Exec(chatID, apiKey)
+	if err != nil {
+		log.Printf("Помилка виконання SQL-запиту: %v", err)
+	}
 	return err
 }
 
@@ -78,14 +94,12 @@ func (s *Storage) GetAPIKey(chatID int64) (string, error) {
 func (s *Storage) ClearHistory(chatID int64) error {
 	log.Printf("Починаємо очищення історії для користувача %d", chatID)
 
-	// Спочатку перевіряємо, чи є історія для цього користувача
 	var count int
 	err := s.db.QueryRow("SELECT COUNT(*) FROM chat_history WHERE chat_id = ?", chatID).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("помилка перевірки історії: %w", err)
 	}
 
-	// Видаляємо всі повідомлення для цього користувача
 	result, err := s.db.Exec("DELETE FROM chat_history WHERE chat_id = ?", chatID)
 	if err != nil {
 		return fmt.Errorf("помилка видалення історії: %w", err)
@@ -96,7 +110,7 @@ func (s *Storage) ClearHistory(chatID int64) error {
 		return fmt.Errorf("помилка отримання кількості видалених рядків: %w", err)
 	}
 
-	log.Printf("Видалено %d повідомлень для користувача %d", rowsAffected, chatID)
+	log.Printf("Видалено %d повідомлень для користувача %d з бази данних", rowsAffected, chatID)
 	return nil
 }
 
@@ -147,8 +161,10 @@ func (s *Storage) GetHistory(chatID int64) ([]struct {
 }
 
 func (s *Storage) SaveUserSettings(chatID int64, model string) error {
-	log.Printf("Зберігаємо налаштування для користувача %d: модель %s", chatID, model)
-	
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.modelCache[chatID] = model // Оновлюємо кеш
 	_, err := s.db.Exec(`
 		INSERT INTO user_settings (chat_id, model) 
 		VALUES (?, ?) 
@@ -156,36 +172,46 @@ func (s *Storage) SaveUserSettings(chatID int64, model string) error {
 			model = excluded.model,
 			updated_at = CURRENT_TIMESTAMP
 	`, chatID, model)
-	
+
 	if err != nil {
-		log.Printf("Помилка збереження налаштувань: %v", err)
+		log.Printf("❌ Помилка збереження налаштувань моделі: %v", err)
 	}
 	return err
 }
 
 func (s *Storage) GetUserSettings(chatID int64) (string, error) {
+	s.mu.RLock()
+	if model, ok := s.modelCache[chatID]; ok {
+		s.mu.RUnlock()
+		return model, nil
+	}
+	s.mu.RUnlock()
+
+	// Якщо немає у кеші, беремо з бази
 	var model string
 	err := s.db.QueryRow("SELECT model FROM user_settings WHERE chat_id = ?", chatID).Scan(&model)
-	
-	if err == sql.ErrNoRows {
-		log.Printf("Налаштування не знайдено для користувача %d, використовуємо модель за замовчуванням", chatID)
-		return api.ModelGPT3, nil
-	}
-	
 	if err != nil {
-		log.Printf("Помилка отримання налаштувань: %v", err)
-		return api.ModelGPT3, err
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("❌ Помилка отримання налаштувань: %w", err)
 	}
 
-	log.Printf("Отримано налаштування для користувача %d: модель %s", chatID, model)
+	// Зберігаємо у кеш
+	s.mu.Lock()
+	s.modelCache[chatID] = model
+	s.mu.Unlock()
+
 	return model, nil
 }
 
 func (s *Storage) HasHistory(chatID int64) (bool, error) {
-	var count int
-	err := s.db.QueryRow("SELECT COUNT(*) FROM chat_history WHERE chat_id = ?", chatID).Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-} 
+	var exists bool
+	err := s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM chat_history WHERE chat_id = ?)", chatID).Scan(&exists)
+	return exists, err
+}
+
+func (s *Storage) Close() error {
+	log.Println("Закривається підключення до бази даних...")
+	return s.db.Close()
+}

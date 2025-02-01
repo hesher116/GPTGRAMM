@@ -4,9 +4,6 @@
 # База даних
 *.db
 
-# Бінарні файли
-/telegram-gpt-bot
-
 # IDE
 .idea/
 .vscode/

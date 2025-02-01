@@ -10,8 +10,8 @@ import (
 )
 
 type ChatGPT struct {
-	apiKey string
-	model  string
+	apiKey  string
+	model   string
 	context []chatMessage
 }
 
@@ -49,6 +49,10 @@ func (c *ChatGPT) SetModel(model string) {
 	c.model = model
 }
 
+func (c *ChatGPT) GetModel() string {
+	return c.model
+}
+
 func (c *ChatGPT) SendMessage(prompt string) (string, error) {
 	c.context = append(c.context, chatMessage{Role: "user", Content: prompt})
 
@@ -66,7 +70,10 @@ func (c *ChatGPT) SendMessage(prompt string) (string, error) {
 		return "", fmt.Errorf("помилка маршалінгу запиту: %w", err)
 	}
 
-	log.Printf("Відправляємо запит до OpenAI: %s", string(jsonData))
+	if len(c.context) > 0 {
+		lastMsg := c.context[len(c.context)-1]
+		log.Printf("OpenAI запит: модель=%s, повідомлення = %s", c.model, lastMsg.Content)
+	}
 
 	req, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -106,4 +113,4 @@ func (c *ChatGPT) SendMessage(prompt string) (string, error) {
 
 func (c *ChatGPT) ClearContext() {
 	c.context = nil
-} 
+}
