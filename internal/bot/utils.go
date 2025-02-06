@@ -5,7 +5,7 @@ import (
 )
 
 const (
-	maxRequestsPerDay = 5
+	maxRequestsPerDay = 3
 	bypassCode        = "1111"
 	maxStoredMessages = 100
 	logFormat         = "%-25s | %-10d | %s\n"

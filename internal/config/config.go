@@ -22,6 +22,7 @@ func LoadConfig() *Config {
 			log.Printf("Помилка завантаження .env файлу: %v", err)
 		}
 	}
+	
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
 	if telegramToken == "" {
 		log.Fatal("❌ ПОМИЛКА: TELEGRAM_TOKEN не знайдено! Переконайтеся, що він є у .env або середовищі")

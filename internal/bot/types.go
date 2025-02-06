@@ -6,7 +6,6 @@ import (
 )
 
 type UserSettings struct {
-	Model        string
 	RequestCount int
 	LastRequest  time.Time
 }

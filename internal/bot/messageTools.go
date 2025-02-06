@@ -28,19 +28,15 @@ func (mt *MessageTools) DeleteMessages(chatID int64, lastMsgID int) (int, error)
 		startID = 1
 	}
 
-	// Формування списку повідомлень для видалення
 	deleteMessages := make([]tgbotapi.DeleteMessageConfig, 0, lastMsgID-startID)
 	for msgID := lastMsgID; msgID > startID; msgID-- {
 		deleteMessages = append(deleteMessages, tgbotapi.NewDeleteMessage(chatID, msgID))
 	}
 
-	// Кількість горутин не повинна перевищувати кількість повідомлень
-	workers := min(5, len(deleteMessages))
+	workers := min(10, len(deleteMessages))
 
-	// Канал для передачі повідомлень у горутини
 	msgChan := make(chan tgbotapi.DeleteMessageConfig, len(deleteMessages))
 
-	// Запускаємо воркерів
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -53,16 +49,13 @@ func (mt *MessageTools) DeleteMessages(chatID int64, lastMsgID int) (int, error)
 		}()
 	}
 
-	// Наповнюємо канал повідомленнями
 	for _, msg := range deleteMessages {
 		msgChan <- msg
 	}
 	close(msgChan)
 
-	// Чекаємо завершення всіх горутин
 	wg.Wait()
 
-	// Логування
 	if deletedCount == 0 {
 		logAction("ВИДАЛЕННЯ", chatID, "Не вдалося видалити жодне повідомлення")
 	} else {
@@ -72,7 +65,6 @@ func (mt *MessageTools) DeleteMessages(chatID int64, lastMsgID int) (int, error)
 	return int(deletedCount), nil
 }
 
-// Функція для обмеження числа воркерів
 func min(a, b int) int {
 	if a < b {
 		return a

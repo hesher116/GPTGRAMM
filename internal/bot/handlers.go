@@ -17,9 +17,9 @@ func (b *Bot) handleMessage(message *tgbotapi.Message) {
 	queue := b.getMessageQueue(chatID)
 	queue.Add(message.MessageID)
 
-	if state, ok := b.users.Load(chatID); ok && state == "awaiting_city" {
+	if state, ok := b.users.Load(fmt.Sprintf("%d_state", chatID)); ok && state == "awaiting_city" {
 		b.getWeatherForCity(chatID, text)
-		b.users.Delete(chatID)
+		b.users.Delete(fmt.Sprintf("%d_state", chatID))
 		return
 	}
 
@@ -147,6 +147,7 @@ func (b *Bot) handleNewChat(chatID int64) {
 	}
 
 	messageTools := NewMessageTools(b.api)
+	time.Sleep(100 * time.Millisecond)
 	deletedCount, _ := messageTools.DeleteMessages(chatID, tempMsg.MessageID)
 
 	deleteMsg := tgbotapi.NewDeleteMessage(chatID, tempMsg.MessageID)
@@ -185,10 +186,17 @@ func (b *Bot) customWeather(chatID int64) {
 	msg.ReplyMarkup = keyboard
 	b.api.Send(msg)
 
-	b.users.Store(chatID, "awaiting_city")
+	b.users.Store(fmt.Sprintf("%d_state", chatID), "awaiting_city")
 }
 
 func (b *Bot) getWeatherForCity(chatID int64, city string) {
+	// Перевіряємо ліміт запитів
+	if !b.checkRequestLimit(chatID) {
+		logAction("ПОМИЛКА", chatID, "⚠️ Досягнуто ліміт запитів")
+		b.sendMessage(chatID, "⚠️ Ви досягли ліміту запитів на сьогодні. Використайте кодову фразу для необмеженого доступу.")
+		return
+	}
+
 	query := fmt.Sprintf("погода в %s. Відповідай українською.", city)
 	b.sendMessage(chatID, fmt.Sprintf("Запитую погоду в місті %s...", city))
 
@@ -245,7 +253,6 @@ func (b *Bot) checkRequestLimit(chatID int64) bool {
 	var settings UserSettings
 	if !exists || value == nil {
 		settings = UserSettings{
-			Model:        api.ModelGPT3,
 			RequestCount: 0,
 			LastRequest:  time.Now(),
 		}
@@ -265,6 +272,8 @@ func (b *Bot) checkRequestLimit(chatID int64) bool {
 	settings.RequestCount++
 	settings.LastRequest = time.Now()
 	b.users.Store(chatID, settings)
+
+	logAction("ПЕРЕВІРКА ЛІМІТУ", chatID, fmt.Sprintf("Запитів сьогодні: %d/%d", settings.RequestCount, maxRequestsPerDay))
 
 	return true
 }

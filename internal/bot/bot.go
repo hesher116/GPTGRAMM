@@ -15,9 +15,8 @@ type Bot struct {
 	Storage    *storage.Storage
 	chatGPTs   sync.Map
 	users      sync.Map
-	modelCache map[int64]string // Кеш моделей користувачів
-	messageIDs map[int64]*MessageQueue
-	mu         sync.RWMutex // Кешування моделей
+	modelCache map[int64]string 
+	messageIDs sync.Map
 }
 
 func NewBot(token string) (*Bot, error) {
@@ -35,9 +34,7 @@ func NewBot(token string) (*Bot, error) {
 		api:        myBot,
 		Storage:    storage,
 		chatGPTs:   sync.Map{},
-		users:      sync.Map{},
-		messageIDs: make(map[int64]*MessageQueue),
-		mu:         sync.RWMutex{},
+		messageIDs: sync.Map{},
 	}, nil
 }
 
@@ -48,7 +45,6 @@ func (b *Bot) Start(ctx context.Context) {
 	u.Timeout = 60
 
 	updates := b.api.GetUpdatesChan(u)
-
 	workerPool := make(chan struct{}, 10)
 
 	for {
@@ -97,14 +93,7 @@ func (b *Bot) sendMessage(chatID int64, text string, markdown ...bool) {
 }
 
 func (b *Bot) getMessageQueue(chatID int64) *MessageQueue {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	queue, exists := b.messageIDs[chatID]
-	if !exists {
-		queue = NewMessageQueue(100)
-		b.messageIDs[chatID] = queue
-	}
-
-	return queue
+	queue, _ := b.messageIDs.LoadOrStore(chatID, NewMessageQueue(100))
+	return queue.(*MessageQueue)
+	
 }
